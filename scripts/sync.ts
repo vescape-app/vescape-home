@@ -1,25 +1,14 @@
-import {
-  cpSync,
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  readlinkSync,
-  rmSync,
-  symlinkSync,
-} from "node:fs";
-import path from "node:path";
+import { $, Glob } from "bun";
 
-const REPO_ROOT = path.resolve(import.meta.dir, "..");
-const SKILLS_DIR = path.join(REPO_ROOT, "skills");
-const LOCAL_SKILLS_DIR = path.join(REPO_ROOT, ".agents", "skills");
-const WORKSPACE_ROOT = path.resolve(REPO_ROOT, "..");
+const REPO_ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
+const WORKSPACE_ROOT = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
+const SKILLS_DIR = `${REPO_ROOT}/skills`;
+const LOCAL_SKILLS_DIR = `${REPO_ROOT}/.agents/skills`;
 
 const TARGETS: Record<string, string> = {
-  vescape: path.join(WORKSPACE_ROOT, "vescape"),
-  "vescape-server": path.join(WORKSPACE_ROOT, "vescape-server"),
-  "vescape-web": path.join(WORKSPACE_ROOT, "vescape-web"),
+  vescape: `${WORKSPACE_ROOT}/vescape`,
+  "vescape-server": `${WORKSPACE_ROOT}/vescape-server`,
+  "vescape-web": `${WORKSPACE_ROOT}/vescape-web`,
 };
 
 interface Options {
@@ -83,67 +72,67 @@ function parseArgs(argv: string[]): Options {
   return { check, targets: selected, explicitTargets };
 }
 
-function listFilesRecursive(dir: string, prefix = ""): Map<string, Buffer> {
-  const result = new Map<string, Buffer>();
-  if (!existsSync(dir)) return result;
-
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    if (entry.name === ".DS_Store") continue;
-    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      for (const [k, v] of listFilesRecursive(full, rel)) {
-        result.set(k, v);
-      }
-    } else if (entry.isFile()) {
-      result.set(rel, readFileSync(full));
-    }
-  }
-  return result;
+async function dirExists(dir: string): Promise<boolean> {
+  return (await $`test -d ${dir}`.nothrow().quiet()).exitCode === 0;
 }
 
-function dirsEqual(srcDir: string, dstDir: string): boolean {
-  if (!existsSync(dstDir)) return false;
-  const srcFiles = listFilesRecursive(srcDir);
-  const dstFiles = listFilesRecursive(dstDir);
-  if (srcFiles.size !== dstFiles.size) return false;
-  for (const [rel, srcBuf] of srcFiles) {
-    const dstBuf = dstFiles.get(rel);
-    if (!dstBuf || !srcBuf.equals(dstBuf)) return false;
+async function snapshotDir(dir: string): Promise<Map<string, Uint8Array>> {
+  const files = new Map<string, Uint8Array>();
+  if (!(await dirExists(dir))) return files;
+
+  const glob = new Glob("**/*");
+  for await (const rel of glob.scan({ cwd: dir, onlyFiles: true, dot: true })) {
+    if (rel === ".DS_Store" || rel.endsWith("/.DS_Store")) continue;
+    files.set(rel, await Bun.file(`${dir}/${rel}`).bytes());
+  }
+  return files;
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+  for (let i = 0; i < a.byteLength; i++) {
+    if (a[i] !== b[i]) return false;
   }
   return true;
 }
 
-function getManagedSkills(): string[] {
-  return readdirSync(SKILLS_DIR, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
-    .map((entry) => entry.name)
-    .sort();
+async function dirsEqual(srcDir: string, dstDir: string): Promise<boolean> {
+  const [srcFiles, dstFiles] = await Promise.all([
+    snapshotDir(srcDir),
+    snapshotDir(dstDir),
+  ]);
+  if (srcFiles.size !== dstFiles.size) return false;
+  for (const [rel, srcBytes] of srcFiles) {
+    const dstBytes = dstFiles.get(rel);
+    if (!dstBytes || !bytesEqual(srcBytes, dstBytes)) return false;
+  }
+  return true;
 }
 
-function syncLocalSymlinks(skills: string[], check: boolean): boolean {
-  mkdirSync(LOCAL_SKILLS_DIR, { recursive: true });
+async function getManagedSkills(): Promise<string[]> {
+  const skills = new Set<string>();
+  const glob = new Glob("*/*");
+  for await (const rel of glob.scan({ cwd: SKILLS_DIR, onlyFiles: false })) {
+    const top = rel.split("/")[0];
+    if (top && !top.startsWith(".")) skills.add(top);
+  }
+  return [...skills].sort();
+}
+
+async function syncLocalSymlinks(skills: string[], check: boolean): Promise<boolean> {
+  if (!check) await $`mkdir -p ${LOCAL_SKILLS_DIR}`.quiet();
   let drifted = false;
 
   for (const skill of skills) {
-    const linkPath = path.join(LOCAL_SKILLS_DIR, skill);
-    const expectedTarget = `../../skills/${skill}`;
-    let ok = false;
+    const linkPath = `${LOCAL_SKILLS_DIR}/${skill}`;
+    const expected = `../../skills/${skill}`;
+    const res = await $`readlink ${linkPath}`.nothrow().quiet();
+    const current = res.exitCode === 0 ? res.text().trim() : "";
 
-    try {
-      const stat = lstatSync(linkPath);
-      if (stat.isSymbolicLink() && readlinkSync(linkPath) === expectedTarget) {
-        ok = true;
-      }
-    } catch {
-      ok = false;
-    }
-
-    if (!ok) {
+    if (current !== expected) {
       drifted = true;
       if (!check) {
-        rmSync(linkPath, { recursive: true, force: true });
-        symlinkSync(expectedTarget, linkPath);
+        await $`rm -rf ${linkPath} && ln -sfn ${expected} ${linkPath}`.quiet();
       }
     }
   }
@@ -151,8 +140,8 @@ function syncLocalSymlinks(skills: string[], check: boolean): boolean {
   return drifted;
 }
 
-const options = parseArgs(process.argv.slice(2));
-const managedSkills = getManagedSkills();
+const options = parseArgs(Bun.argv.slice(2));
+const managedSkills = await getManagedSkills();
 
 if (managedSkills.length === 0) {
   console.error(`No skills found in ${SKILLS_DIR}`);
@@ -161,8 +150,7 @@ if (managedSkills.length === 0) {
 
 let hasDrift = false;
 
-const localDrifted = syncLocalSymlinks(managedSkills, options.check);
-if (localDrifted) {
+if (await syncLocalSymlinks(managedSkills, options.check)) {
   if (options.check) {
     console.log("vescape-home: local .agents/skills symlinks out of sync");
     hasDrift = true;
@@ -173,7 +161,7 @@ if (localDrifted) {
 
 for (const name of options.targets) {
   const repoPath = TARGETS[name];
-  if (!existsSync(repoPath)) {
+  if (!(await dirExists(repoPath))) {
     const msg = `${name}: skipped (${repoPath} not found)`;
     if (options.explicitTargets) {
       console.error(msg);
@@ -183,22 +171,21 @@ for (const name of options.targets) {
     continue;
   }
 
-  const targetSkillsDir = path.join(repoPath, ".agents", "skills");
+  const targetSkillsDir = `${repoPath}/.agents/skills`;
   if (!options.check) {
-    mkdirSync(targetSkillsDir, { recursive: true });
+    await $`mkdir -p ${targetSkillsDir}`.quiet();
   }
 
   const changed: string[] = [];
 
   for (const skill of managedSkills) {
-    const src = path.join(SKILLS_DIR, skill);
-    const dst = path.join(targetSkillsDir, skill);
+    const src = `${SKILLS_DIR}/${skill}`;
+    const dst = `${targetSkillsDir}/${skill}`;
 
-    if (!dirsEqual(src, dst)) {
+    if (!(await dirsEqual(src, dst))) {
       changed.push(skill);
       if (!options.check) {
-        rmSync(dst, { recursive: true, force: true });
-        cpSync(src, dst, { recursive: true });
+        await $`rm -rf ${dst} && cp -R ${src} ${dst}`.quiet();
       }
     }
   }
