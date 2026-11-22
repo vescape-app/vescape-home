@@ -1,0 +1,21 @@
+{
+  "name": "vescape",
+  "version": "0.1.0",
+  "description": "Sync shared Vescape agent skills across companion repositories",
+  "type": "module",
+  "bin": {
+    "vescape": "src/cli.ts"
+  },
+  "files": ["src", "dist/skills"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vescape-app/vescape-home.git",
+    "directory": "packages/vescape"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org"
+  },
+  "scripts": {
+    "prepack": "bun run pack-skills.ts"
+  }
+}
