@@ -1,0 +1,9 @@
+{
+  "name": "vescape-home",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "sync": "bun run scripts/sync.ts",
+    "sync:check": "bun run scripts/sync.ts --check"
+  }
+}
